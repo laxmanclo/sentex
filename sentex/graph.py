@@ -131,6 +131,11 @@ class ContextGraph:
             first_sentence=sentences[0] if sentences else "",
             token_counts=L0L1L2L3TokenCounts(l1=l1_tokens, l3=l3_tokens),
         )
+        # Always build extractive L2 from the first N sentences so the
+        # L1→L2 fallback chain never hits an empty string, even without LLM.
+        node.l2 = _build_extractive_l2(sentences)
+        node.token_counts.l2 = count_tokens(node.l2)
+
         self._nodes[node_id] = node
 
         if generate_summaries and sentences:
@@ -588,6 +593,19 @@ def _extractive_l0(node: "ContextNode") -> str:
 def _extractive_l2(node: "ContextNode") -> str:
     """Return node.l2 if non-empty, else empty string. Explicit for clarity."""
     return node.l2 or ""
+
+
+def _build_extractive_l2(sentences: list[str], max_tokens: int = 300) -> str:
+    """Build an extractive L2 from the first N sentences up to max_tokens."""
+    from .tokens import count_tokens as _ct
+    collected, total = [], 0
+    for s in sentences:
+        t = _ct(s)
+        if total + t > max_tokens:
+            break
+        collected.append(s)
+        total += t
+    return " ".join(collected)
 
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:

@@ -16,16 +16,17 @@ if TYPE_CHECKING:
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
-    id          TEXT PRIMARY KEY,
-    produced_by TEXT NOT NULL,
-    l0          TEXT,
-    l2          TEXT,
-    l3          TEXT,
-    sentence_ids TEXT NOT NULL,
-    token_l0    INTEGER DEFAULT 0,
-    token_l1    INTEGER DEFAULT 0,
-    token_l2    INTEGER DEFAULT 0,
-    token_l3    INTEGER DEFAULT 0
+    id              TEXT PRIMARY KEY,
+    produced_by     TEXT NOT NULL,
+    l0              TEXT,
+    l2              TEXT,
+    l3              TEXT,
+    first_sentence  TEXT DEFAULT '',
+    sentence_ids    TEXT NOT NULL,
+    token_l0        INTEGER DEFAULT 0,
+    token_l1        INTEGER DEFAULT 0,
+    token_l2        INTEGER DEFAULT 0,
+    token_l3        INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sentences (
@@ -66,13 +67,17 @@ def save(graph: "ContextGraph", path: str | Path) -> None:
     # nodes
     for node in graph._nodes.values():
         cur.execute(
-            """INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT OR REPLACE INTO nodes
+               (id, produced_by, l0, l2, l3, first_sentence, sentence_ids,
+                token_l0, token_l1, token_l2, token_l3)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 node.id,
                 node.produced_by,
                 node.l0,
                 node.l2,
                 json.dumps(node.l3) if not isinstance(node.l3, str) else node.l3,
+                node.first_sentence,
                 json.dumps(node.sentence_ids),
                 node.token_counts.l0,
                 node.token_counts.l1,
@@ -146,8 +151,11 @@ def load(path: str | Path, graph: "ContextGraph") -> None:
         usage_boost[(src, dst)] = boost
 
     nodes: dict[str, ContextNode] = {}
-    for row in con.execute("SELECT * FROM nodes"):
-        nid, produced_by, l0, l2, l3_raw, sid_json, tl0, tl1, tl2, tl3 = row
+    for row in con.execute(
+        "SELECT id, produced_by, l0, l2, l3, first_sentence, sentence_ids,"
+        " token_l0, token_l1, token_l2, token_l3 FROM nodes"
+    ):
+        nid, produced_by, l0, l2, l3_raw, first_sentence, sid_json, tl0, tl1, tl2, tl3 = row
         try:
             l3 = json.loads(l3_raw)
         except Exception:
@@ -159,6 +167,7 @@ def load(path: str | Path, graph: "ContextGraph") -> None:
             sentence_ids=json.loads(sid_json),
             l0=l0 or "",
             l2=l2 or "",
+            first_sentence=first_sentence or "",
             token_counts=L0L1L2L3TokenCounts(l0=tl0, l1=tl1, l2=tl2, l3=tl3),
         )
 
