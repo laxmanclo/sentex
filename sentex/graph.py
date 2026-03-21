@@ -4,11 +4,14 @@ Holds:
 - global sentence array (embeddings + text + metadata)
 - per-node ContextNode records
 - KNN adjacency dict
-- usage weights (edge boosts)
+- usage weights with hotness scoring (frequency × recency decay)
+- bidirectional node relations
+- optional telemetry collection
 """
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import numpy as np
@@ -16,6 +19,8 @@ import numpy as np
 from .embedder import Embedder
 from .knn import Adjacency, build_knn, update_knn
 from .llm import generate_l0, generate_l2
+from .relations import RelationIndex, RelationKind
+from .scoring import HotnessScore, compute_hotness
 from .splitter import split_sentences
 from .tokens import count_tokens, count_tokens_list
 from .types import (
@@ -44,25 +49,39 @@ _L1_BUDGET_FALLBACK = ["l2", "l0"]
 class ContextGraph:
     def __init__(
         self,
-        embedder: Embedder | None = None,
+        embedder: "Embedder | None" = None,
         knn_k: int = 5,
         llm_model: str | None = None,
+        metrics: "Any | None" = None,
+        hotness_freq_scale: float = 10.0,
+        hotness_half_life_h: float = 24.0,
     ) -> None:
         self.embedder = embedder or Embedder()
         self.knn_k = knn_k
         self.llm_model = llm_model
+        self._metrics = metrics  # MetricsCollector | None
+
+        # Hotness scoring parameters
+        self._hotness_freq_scale = hotness_freq_scale
+        self._hotness_half_life_s = hotness_half_life_h * 3600
 
         # Global sentence store — shape (0,) until first ingest sets actual dim
         self._embeddings: np.ndarray = np.empty((0,), dtype=np.float32)
         self._sentences: list[str] = []
         self._metadata: list[SentenceMetadata] = []
 
-        # KNN adjacency with usage-boosted weights
+        # KNN adjacency + hotness-scored edge boosts
         self._adjacency: Adjacency = {}
-        self._usage_boost: dict[tuple[int, int], float] = {}  # (i,j) → extra weight
+        self._usage_boost: dict[tuple[int, int], HotnessScore] = {}
 
         # Context nodes
         self._nodes: dict[str, ContextNode] = {}
+
+        # Bidirectional node relations
+        self._relations: RelationIndex = RelationIndex()
+
+        # Lazy filesystem view
+        self._fs: Any = None
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -173,15 +192,30 @@ class ContextGraph:
     # ------------------------------------------------------------------
 
     def _effective_adjacency(self) -> Adjacency:
-        """Return adjacency with usage boosts applied."""
+        """Return adjacency with hotness-scored boosts applied.
+
+        Hotness = sigmoid(hit_count / freq_scale) × exp(-ln2 × age / half_life)
+        This replaces the old flat additive boost with a principled model that
+        decays over time and saturates with frequency.
+        """
         if not self._usage_boost:
             return self._adjacency
+        now = time.time()
         boosted: Adjacency = {}
         for i, neighbors in self._adjacency.items():
-            new_neighbors = [
-                (j, sim + self._usage_boost.get((i, j), 0.0))
-                for j, sim in neighbors
-            ]
+            new_neighbors = []
+            for j, sim in neighbors:
+                score = self._usage_boost.get((i, j))
+                extra = (
+                    compute_hotness(
+                        score, now=now,
+                        freq_scale=self._hotness_freq_scale,
+                        half_life_s=self._hotness_half_life_s,
+                    )
+                    if score is not None
+                    else 0.0
+                )
+                new_neighbors.append((j, sim + extra))
             new_neighbors.sort(key=lambda x: -x[1])
             boosted[i] = new_neighbors
         return boosted
@@ -225,7 +259,7 @@ class ContextGraph:
 
         query_vec = self.embedder.embed_one(query)
         adj = self._effective_adjacency()
-        sentences, confidence = retrieve_l1(
+        sentences, confidence, converged = retrieve_l1(
             query_vec,
             self._embeddings,
             self._sentences,
@@ -233,6 +267,21 @@ class ContextGraph:
             budget_tokens,
             candidate_ids=node.sentence_ids,
         )
+
+        # Record telemetry if collector is attached
+        if self._metrics is not None:
+            from .telemetry import OperationMetrics
+            from .tokens import count_tokens_list
+            self._metrics.record(OperationMetrics(
+                operation="retrieve",
+                node_id=node_id,
+                duration_ms=0.0,   # caller times the full retrieve() call
+                sentences_in=len(sentences),
+                tokens_out=count_tokens_list(sentences),
+                layer_used="l1",
+                confidence=confidence,
+                converged=converged,
+            ))
 
         if confidence < confidence_threshold:
             content = node.l2 or _extractive_l2(node) or node.l0
@@ -384,18 +433,14 @@ class ContextGraph:
 
         # Boost every edge where the source sentence is in a used node.
         # Destination can be in any node — this is the cross-node boost.
+        # HotnessScore.hit() records timestamp for recency decay.
+        now = time.time()
         for i in all_used_sentence_ids:
             for j, _ in self._adjacency.get(i, []):
-                if j in all_used_sentence_ids:
-                    # Stronger boost for edges within the used set
-                    self._usage_boost[(i, j)] = (
-                        self._usage_boost.get((i, j), 0.0) + boost
-                    )
-                else:
-                    # Weaker boost for edges pointing outside used set
-                    self._usage_boost[(i, j)] = (
-                        self._usage_boost.get((i, j), 0.0) + boost * 0.3
-                    )
+                key = (i, j)
+                if key not in self._usage_boost:
+                    self._usage_boost[key] = HotnessScore()
+                self._usage_boost[key].hit(now=now)
 
     # ------------------------------------------------------------------
     # Node-level retrieval (L0 scan)
@@ -516,13 +561,68 @@ class ContextGraph:
     def stats(self) -> dict:
         """Return a summary of graph state — useful for debugging and monitoring."""
         total_edges = sum(len(v) for v in self._adjacency.values())
+        hot_edges = sum(
+            1 for s in self._usage_boost.values() if s.hit_count > 0
+        )
         return {
             "nodes": self.node_count,
             "sentences": self.sentence_count,
             "edges": total_edges,
-            "edge_boosts": len(self._usage_boost),
+            "hot_edges": hot_edges,
+            "relations": len(self._relations),
             "node_ids": list(self._nodes.keys()),
         }
+
+    # ------------------------------------------------------------------
+    # Relations
+    # ------------------------------------------------------------------
+
+    def link(
+        self,
+        src: str,
+        dst: str,
+        kind: RelationKind = "related",
+        weight: float = 1.0,
+        created_by: str = "__system__",
+    ):
+        """Create an explicit semantic relation from src → dst.
+
+        Example:
+            graph.link("working/analysis", "resources/search", kind="derived_from")
+        """
+        return self._relations.link(src, dst, kind=kind, weight=weight, created_by=created_by)
+
+    def unlink(self, src: str, dst: str, kind: RelationKind | None = None) -> int:
+        """Remove relations between src and dst. Returns count removed."""
+        return self._relations.unlink(src, dst, kind=kind)
+
+    def neighbors(
+        self,
+        node_id: str,
+        direction: str = "both",
+        kind: RelationKind | None = None,
+    ) -> list:
+        """Return Relation objects for a node's explicit relations."""
+        return self._relations.neighbors(node_id, direction=direction, kind=kind)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # Filesystem view
+    # ------------------------------------------------------------------
+
+    @property
+    def fs(self):
+        """Virtual filesystem view over this graph (ls, tree, stat, find).
+
+        Example:
+            graph.fs.ls("resources")
+            graph.fs.tree()
+            graph.fs.stat("resources/search")
+            graph.fs.find("working/*analysis*")
+        """
+        if self._fs is None:
+            from .fs import GraphFS
+            self._fs = GraphFS(self)
+        return self._fs
 
     # ------------------------------------------------------------------
     # Simple interface for bring-your-own-agent usage

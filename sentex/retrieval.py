@@ -2,6 +2,11 @@
 
 Priority-queue BFS from the highest-similarity entry point,
 collecting sentences until the token budget is exhausted.
+
+Convergence-based early exit: if the top-k result set stabilises for
+`convergence_patience` consecutive heap pops, BFS terminates early.
+This cuts retrieval time significantly on large graphs (10k+ sentences)
+where the relevant cluster is tight and surrounded by noise.
 """
 from __future__ import annotations
 
@@ -20,17 +25,28 @@ def retrieve_l1(
     adjacency: Adjacency,
     budget_tokens: int,
     candidate_ids: list[int] | None = None,
-) -> tuple[list[str], float]:
-    """Return (sentences, confidence_score).
+    convergence_k: int = 5,
+    convergence_patience: int = 3,
+) -> tuple[list[str], float, bool]:
+    """Return (sentences, confidence_score, converged).
 
-    candidate_ids: restrict entry-point search to these indices (for per-node retrieval).
-    confidence_score: cosine similarity of the best entry point.
+    Args:
+        candidate_ids:         Restrict entry-point search to these indices
+                               (used for per-node retrieval).
+        convergence_k:         Track top-k sentences for convergence check.
+        convergence_patience:  Stop if top-k set is unchanged for this many
+                               consecutive heap pops.
+
+    Returns:
+        sentences:   Collected sentences sorted by relevance descending.
+        confidence:  Cosine similarity of the best entry point.
+        converged:   True if BFS terminated via convergence (not budget exhaustion).
     """
     if len(embeddings) == 0:
-        return [], 0.0
+        return [], 0.0, False
 
     if candidate_ids is not None and len(candidate_ids) == 0:
-        return [], 0.0
+        return [], 0.0, False
 
     # 1. Compute similarities for entry-point selection
     if candidate_ids is not None:
@@ -44,8 +60,9 @@ def retrieve_l1(
         sims = embeddings @ query_vec             # (n,)
         entry = int(np.argmax(sims))
         confidence = float(sims[entry])
-        # Pre-compute for priority scoring
-        sims_all = sims
+
+    # Full similarity vector for neighbour scoring
+    sim_lookup = embeddings @ query_vec if candidate_ids is None else embeddings @ query_vec
 
     # 2. BFS via max-heap (negate sim for min-heap)
     visited: set[int] = set()
@@ -55,12 +72,10 @@ def retrieve_l1(
     # heap: (-similarity, sentence_idx)
     heap: list[tuple[float, int]] = [(-confidence, entry)]
 
-    # Need full similarity vector for neighbour scoring when candidate_ids is None
-    if candidate_ids is None:
-        sim_lookup = sims_all
-    else:
-        # Build full similarity vector lazily
-        sim_lookup = embeddings @ query_vec
+    # Convergence tracking: top-k set of collected sentence indices
+    top_k_set: frozenset[int] = frozenset()
+    stable_streak = 0
+    converged = False
 
     while heap and token_total < budget_tokens:
         neg_score, idx = heapq.heappop(heap)
@@ -76,6 +91,24 @@ def retrieve_l1(
         collected.append((sentence, -neg_score))
         token_total += toks
 
+        # Convergence check: compare current top-k to previous
+        current_idxs = sorted(
+            range(len(collected)),
+            key=lambda i: -collected[i][1]
+        )[:convergence_k]
+        current_top_k = frozenset(current_idxs)
+
+        if len(collected) >= convergence_k:
+            if current_top_k == top_k_set:
+                stable_streak += 1
+                if stable_streak >= convergence_patience:
+                    converged = True
+                    break
+            else:
+                stable_streak = 0
+            top_k_set = current_top_k
+
+        # Expand neighbours
         for neighbor_idx, _edge_sim in adjacency.get(idx, []):
             if neighbor_idx not in visited:
                 score = float(sim_lookup[neighbor_idx])
@@ -83,4 +116,4 @@ def retrieve_l1(
 
     # Return sentences ordered by relevance score descending
     collected.sort(key=lambda x: -x[1])
-    return [s for s, _ in collected], confidence
+    return [s for s, _ in collected], confidence, converged
