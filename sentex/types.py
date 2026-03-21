@@ -26,8 +26,9 @@ class ContextNode:
     produced_by: str            # agent id that wrote this node
     l3: Any                     # full raw content
     sentence_ids: list[int]     # indices into graph-level arrays
-    l0: str = ""                # ~50 token identity sentence
-    l2: str = ""                # ~2k summary
+    l0: str = ""                # ~50 token identity sentence (LLM-generated or extractive)
+    l2: str = ""                # ~2k summary (LLM-generated or extractive)
+    first_sentence: str = ""    # first sentence of content — used as extractive L0 fallback
     token_counts: L0L1L2L3TokenCounts = field(default_factory=L0L1L2L3TokenCounts)
 
 

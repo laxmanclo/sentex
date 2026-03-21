@@ -1,11 +1,19 @@
-"""FastAPI HTTP server — POST /assemble.
+"""Sentex FastAPI server.
 
-Allows TypeScript (or any HTTP client) to use Engram as a service.
+Exposes the ContextGraph over HTTP so TypeScript, Go, or any other
+language can use Sentex as a context management service.
 
-Start with:  uvicorn engram.server:app --port 8765
+Start:
+    uvicorn sentex.server:app --port 8765
+
+Environment:
+    SENTEX_PERSIST   Path to SQLite file for cross-run memory (optional).
+                     If set, edge weights and summaries persist across restarts.
 """
 from __future__ import annotations
 
+import os
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -13,29 +21,66 @@ from pydantic import BaseModel
 
 from .graph import ContextGraph
 from .manifest import defineAgent
-from .types import Read, Write
-
-app = FastAPI(title="Engram", version="0.1.0")
-
-# Single shared graph instance for the server lifetime
-_graph = ContextGraph()
+from .types import AutoRead, Read
 
 
 # ------------------------------------------------------------------
-# Request / response models
+# App state — graph is created once, optionally backed by MemoryStore
 # ------------------------------------------------------------------
+
+class _State:
+    graph: ContextGraph
+
+
+state = _State()
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    persist = os.getenv("SENTEX_PERSIST")
+    if persist:
+        from .store import MemoryStore
+        store = MemoryStore(persist)
+        state.graph = ContextGraph()
+        boosts = store.load_edge_boosts()
+        for (src, dst), w in boosts.items():
+            state.graph._usage_boost[(src - 1, dst - 1)] = w
+        state.graph._store = store
+    else:
+        state.graph = ContextGraph()
+    yield
+
+
+app = FastAPI(title="Sentex", version="0.1.0", lifespan=_lifespan)
+
+
+# ------------------------------------------------------------------
+# Pydantic models
+# ------------------------------------------------------------------
+
+class PutRequest(BaseModel):
+    node_id: str
+    content: str
+    agent_id: str = "agent"
+
+
+class GetRequest(BaseModel):
+    node_id: str
+    query: str
+    budget: int = 2000
+    layer: str = "l1"
+
+
+class ScanRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    scope: str | None = None
 
 
 class ReadModel(BaseModel):
     node_id: str
     layer: str = "l1"
     budget: int = 2000
-
-
-class IngestRequest(BaseModel):
-    node_id: str
-    content: str
-    agent_id: str
 
 
 class AssembleRequest(BaseModel):
@@ -48,28 +93,67 @@ class AssembleRequest(BaseModel):
 
 
 class MarkUsedRequest(BaseModel):
-    context_token: str  # unused — for future auth
-    assembled_node_ids: list[str]
-    used_ids: list[str]
-
-
-class ValidateRequest(BaseModel):
-    agents: list[dict[str, Any]]
+    node_ids: list[str]
 
 
 # ------------------------------------------------------------------
-# Endpoints
+# Simple API — put / get / used / scan
 # ------------------------------------------------------------------
 
+@app.post("/put", summary="Store agent output in the graph")
+async def put(req: PutRequest) -> dict:
+    """Store an agent's output. Sentences are split, embedded, and added to the KNN graph."""
+    node = state.graph.ingest(req.node_id, req.content, agent_id=req.agent_id)
+    return {
+        "node_id": node.id,
+        "sentences": len(node.sentence_ids),
+        "first_sentence": node.first_sentence,
+    }
 
-@app.post("/ingest")
-async def ingest(req: IngestRequest) -> dict:
-    node = await _graph.ingest_async(req.node_id, req.content, req.agent_id)
-    return {"node_id": node.id, "sentences": len(node.sentence_ids)}
+
+@app.post("/get", summary="Retrieve context for a node")
+def get(req: GetRequest) -> dict:
+    """Retrieve context from a node at the specified layer and budget."""
+    if req.node_id not in state.graph._nodes:
+        raise HTTPException(status_code=404, detail=f"Node '{req.node_id}' not found")
+
+    content = state.graph.get(req.node_id, query=req.query, budget=req.budget, layer=req.layer)
+    _, layer_used, confidence = state.graph.retrieve(
+        req.node_id, req.layer, req.query, req.budget
+    )
+    return {
+        "node_id": req.node_id,
+        "content": content,
+        "layer_used": layer_used,
+        "confidence": confidence,
+        "is_list": isinstance(content, list),
+    }
 
 
-@app.post("/assemble")
+@app.post("/used", summary="Mark a node as used to boost future retrieval")
+def used(req: MarkUsedRequest) -> dict:
+    """Boost edge weights for nodes that were useful. Improves future retrieval."""
+    for node_id in req.node_ids:
+        state.graph.used(node_id)
+    return {"ok": True, "boosted": req.node_ids}
+
+
+@app.post("/scan", summary="Find the most relevant nodes for a query")
+def scan(req: ScanRequest) -> dict:
+    """Scan all nodes at L0 and return the top-k most relevant to the query."""
+    results = state.graph.scan_nodes(req.query, top_k=req.top_k, scope=req.scope)
+    return {
+        "results": [{"node_id": nid, "score": score} for nid, score in results]
+    }
+
+
+# ------------------------------------------------------------------
+# Structured API — assemble / mark_used
+# ------------------------------------------------------------------
+
+@app.post("/assemble", summary="Assemble context for an agent manifest")
 def assemble(req: AssembleRequest) -> dict:
+    """Assemble context across multiple reads with budget enforcement and fallback."""
     reads = [Read(r.node_id, r.layer, r.budget) for r in req.reads]
     agent = defineAgent(
         id=req.agent_id,
@@ -79,7 +163,7 @@ def assemble(req: AssembleRequest) -> dict:
         fallback=req.fallback,
         confidence_threshold=req.confidence_threshold,
     )
-    assembled = _graph.assemble_for(agent, req.query)
+    assembled = state.graph.assemble_for(agent, req.query)
     return {
         "context": assembled.context,
         "token_count": assembled.token_count,
@@ -92,26 +176,23 @@ def assemble(req: AssembleRequest) -> dict:
     }
 
 
-@app.post("/mark_used")
+@app.post("/mark_used", summary="Mark assembled nodes as used")
 def mark_used(req: MarkUsedRequest) -> dict:
-    # Reconstruct a minimal AssembledContext for the call
     from .types import AssembledContext
-
     dummy = AssembledContext(
-        context={},
-        token_count=0,
-        budget=0,
-        utilization=0.0,
-        layers_used={},
-        compressed=[],
-        missing=[],
-        confidence={},
+        context={nid: [] for nid in req.node_ids},
+        token_count=0, budget=0, utilization=0.0,
+        layers_used={}, compressed=[], missing=[], confidence={},
     )
-    _graph.mark_used(dummy, req.used_ids)
+    state.graph.mark_used(dummy, req.node_ids)
     return {"ok": True}
 
 
-@app.get("/nodes")
+# ------------------------------------------------------------------
+# Inspection
+# ------------------------------------------------------------------
+
+@app.get("/nodes", summary="List all nodes in the graph")
 def list_nodes() -> dict:
     return {
         "nodes": [
@@ -119,10 +200,39 @@ def list_nodes() -> dict:
                 "id": n.id,
                 "produced_by": n.produced_by,
                 "sentences": len(n.sentence_ids),
-                "l0": n.l0,
+                "l0": n.l0 or n.first_sentence,
+                "has_l2": bool(n.l2),
+                "token_counts": {
+                    "l0": n.token_counts.l0,
+                    "l1": n.token_counts.l1,
+                    "l2": n.token_counts.l2,
+                    "l3": n.token_counts.l3,
+                },
             }
-            for n in _graph._nodes.values()
+            for n in state.graph._nodes.values()
         ]
+    }
+
+
+@app.get("/nodes/{node_id:path}", summary="Inspect a single node")
+def get_node(node_id: str) -> dict:
+    node = state.graph.get_node(node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+    return {
+        "id": node.id,
+        "produced_by": node.produced_by,
+        "sentences": len(node.sentence_ids),
+        "l0": node.l0 or node.first_sentence,
+        "l2": node.l2,
+        "has_l3": node.l3 is not None,
+        "first_sentence": node.first_sentence,
+        "token_counts": {
+            "l0": node.token_counts.l0,
+            "l1": node.token_counts.l1,
+            "l2": node.token_counts.l2,
+            "l3": node.token_counts.l3,
+        },
     }
 
 
@@ -130,6 +240,7 @@ def list_nodes() -> dict:
 def health() -> dict:
     return {
         "status": "ok",
-        "nodes": _graph.node_count,
-        "sentences": _graph.sentence_count,
+        "nodes": state.graph.node_count,
+        "sentences": state.graph.sentence_count,
+        "persist": bool(os.getenv("SENTEX_PERSIST")),
     }

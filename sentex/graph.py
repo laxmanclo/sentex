@@ -52,8 +52,8 @@ class ContextGraph:
         self.knn_k = knn_k
         self.llm_model = llm_model
 
-        # Global sentence store
-        self._embeddings: np.ndarray = np.empty((0, 384), dtype=np.float32)
+        # Global sentence store — shape (0,) until first ingest sets actual dim
+        self._embeddings: np.ndarray = np.empty((0,), dtype=np.float32)
         self._sentences: list[str] = []
         self._metadata: list[SentenceMetadata] = []
 
@@ -73,12 +73,17 @@ class ContextGraph:
         node_id: str,
         content: Any,
         agent_id: str,
-        generate_summaries: bool = True,
+        generate_summaries: bool = False,
     ) -> ContextNode:
         """Ingest *content* as a new ContextNode.
 
-        Splits into sentences, embeds, updates KNN.
-        Schedules async L0/L2 generation if generate_summaries=True.
+        Splits into sentences, embeds, updates KNN, stores extractive L0/L2.
+
+        Args:
+            generate_summaries: If True, fires async LLM calls to generate
+                high-quality L0 identity and L2 summary (requires ENGRAM_LLM_MODEL
+                or OPENAI_API_KEY). Defaults to False — extractive fallbacks are
+                always built from the content itself and work without an LLM.
         """
         text = content if isinstance(content, str) else str(content)
         sentences = split_sentences(text)
@@ -88,7 +93,9 @@ class ContextGraph:
         # Embed new sentences
         if sentences:
             vecs = self.embedder.embed(sentences)
-            if self._embeddings.shape[0] == 0:
+            # On first ingest, _embeddings is 1-D placeholder — replace directly.
+            # On subsequent ingests, vstack (both arrays now have shape (n, D)).
+            if self._embeddings.ndim == 1:
                 self._embeddings = vecs
             else:
                 self._embeddings = np.vstack([self._embeddings, vecs])
@@ -121,6 +128,7 @@ class ContextGraph:
             produced_by=agent_id,
             l3=content,
             sentence_ids=sentence_ids,
+            first_sentence=sentences[0] if sentences else "",
             token_counts=L0L1L2L3TokenCounts(l1=l1_tokens, l3=l3_tokens),
         )
         self._nodes[node_id] = node
@@ -318,11 +326,13 @@ class ContextGraph:
                         compressed.append(node_id)
                         break
                 else:
-                    # Truncate l0 to fit
+                    # Nothing fits — serve the shortest possible representation
                     node = self._nodes[node_id]
-                    content = node.l0[:remaining * 4]  # rough char estimate
+                    l0_text = node.l0 or _extractive_l0(node)
+                    # Token-aware truncation: encode, slice, decode
+                    content = _truncate_to_tokens(l0_text, remaining)
                     layer_used = "l0"
-                    content_tokens = min(count_tokens(content), remaining)
+                    content_tokens = count_tokens(content)
                     compressed.append(node_id)
 
             context[node_id] = content
@@ -566,17 +576,27 @@ class ContextGraph:
 # ------------------------------------------------------------------
 
 def _extractive_l0(node: "ContextNode") -> str:
-    """First sentence of L2 (or first sentence of L3) as an extractive L0."""
+    """Extractive L0: first sentence stored at ingest time, or first sentence of L2."""
+    if node.first_sentence:
+        return node.first_sentence
     if node.l2:
-        # First sentence of the summary
         first = node.l2.split(".")[0].strip()
-        return first + "." if first and not first.endswith(".") else first
-    if node.sentence_ids is not None and hasattr(node, "_sentences_ref"):
-        # Would need graph reference — skip for now
-        pass
+        return (first + ".") if first and not first.endswith(".") else first
     return ""
 
 
 def _extractive_l2(node: "ContextNode") -> str:
     """Return node.l2 if non-empty, else empty string. Explicit for clarity."""
     return node.l2 or ""
+
+
+def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate *text* to at most *max_tokens* tokens using the actual tokenizer."""
+    from .tokens import _get_encoder
+    if max_tokens <= 0 or not text:
+        return ""
+    enc = _get_encoder()
+    tokens = enc.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return enc.decode(tokens[:max_tokens])
