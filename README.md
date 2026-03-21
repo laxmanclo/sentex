@@ -41,7 +41,7 @@ graph.put("search-results", output, agent_id="researcher")
 
 # === Build context for Agent 2 ===
 context = graph.get("search-results", query="write a 60-second script", budget=2000)
-# context = [8 most relevant sentences from Agent 1's output]
+# context = [most relevant sentences from Agent 1's output]
 
 prompt = f"Use this research:\n{chr(10).join(context)}\n\nWrite the script."
 script = my_agent_2.run(prompt)
@@ -62,7 +62,7 @@ Every node in the graph has four representations:
 |-------|------|-------------|
 | **L0** | ~50-token identity sentence | Scanning many nodes to decide which to load |
 | **L1** | Sentence-graph retrieval | Default — get the relevant sentences, nothing else |
-| **L2** | ~2000-token summary | When you need a coherent overview, not fragments |
+| **L2** | ~300-token extractive summary | When you need a coherent overview, not fragments |
 | **L3** | Full raw content | When the agent needs everything |
 
 ```python
@@ -71,17 +71,17 @@ context = graph.get("search-results", query="immune cells", budget=2000)
 # → ["T-cells recognize antigens on pathogen surfaces.",
 #    "Antigen recognition triggers the adaptive immune cascade.", ...]
 
-# L2 — summary
+# L2 — extractive summary (first ~300 tokens of content)
 summary = graph.get("search-results", query="", budget=2000, layer="l2")
-# → "A synthesis of five sources covering T-cells, B-cells, and macrophages..."
+# → "The immune system has two branches: innate and adaptive. T-cells..."
 
 # L3 — full content
 full = graph.get("search-results", query="", budget=99999, layer="l3")
 # → the entire raw output from Agent 1
 
-# L0 — identity (for node scanning)
+# L0 — identity (first sentence, used by scan_nodes)
 identity = graph.get("search-results", query="", budget=100, layer="l0")
-# → "Search results covering adaptive immune responses across five sources."
+# → "The immune system has two branches: innate and adaptive."
 ```
 
 ---
@@ -97,17 +97,17 @@ graph = ContextGraph()
 research = researcher_agent.run("immune system")
 graph.put("resources/research", research, agent_id="researcher")
 
-# Agent 2: analyst — only sees the research sentences relevant to analysis
+# Agent 2: analyst — only sees the research sentences relevant to its task
 context = graph.get("resources/research", query="key mechanisms and findings", budget=1500)
 analysis = analyst_agent.run(f"Analyse:\n{chr(10).join(context)}")
 graph.put("working/analysis", analysis, agent_id="analyst")
 graph.used("resources/research")
 
-# Agent 3: writer — graph edges cross agent boundaries automatically
+# Agent 3: writer — graph edges cross agent boundaries automatically.
 # Sentences from research and analysis that are semantically close get KNN edges.
-# Agent 3's BFS traverses those edges — gets the most relevant from BOTH nodes.
-research_ctx = graph.get("resources/research", query="write a script", budget=1000)
-analysis_ctx  = graph.get("working/analysis",  query="write a script", budget=800)
+# BFS traversal for each node surfaces the most relevant from both.
+research_ctx  = graph.get("resources/research", query="write a script", budget=1000)
+analysis_ctx  = graph.get("working/analysis",   query="write a script", budget=800)
 
 script = writer_agent.run(
     f"Research:\n{chr(10).join(research_ctx)}\n\n"
@@ -148,10 +148,16 @@ assembled = graph.assemble_for(writer_manifest, query="write a video script")
 # assembled.layers_used     → {"resources/research": "l1", "working/analysis": "l2"}
 # assembled.confidence      → {"resources/research": 0.84, "working/analysis": 1.0}
 # assembled.compressed      → []   (nothing fell back due to budget)
+# assembled.missing         → []   (all declared reads were available)
 
-prompt = assembled.render()   # formatted prompt block
+# Build a prompt from the assembled context:
+sections = []
+for node_id, content in assembled.context.items():
+    text = "\n".join(content) if isinstance(content, list) else content
+    sections.append(f"[{node_id}]\n{text}")
+prompt = "\n\n".join(sections) + "\n\nWrite a 60-second video script."
+
 script = writer_agent.run(prompt)
-
 graph.put("working/script", script, agent_id="writer")
 graph.mark_used(assembled, used_ids=["resources/research"])
 ```
@@ -184,23 +190,23 @@ manifest = defineAgent(
 assembled = graph.assemble_for(manifest, query="immune system mechanisms")
 # → scans all resources/* nodes at L0
 # → retrieves L1 from the 3 most relevant
-# → keys: "auto:resources/research", "auto:resources/docs", ...
+# → keys in assembled.context: "auto:resources/research", "auto:resources/docs", ...
 ```
 
 ---
 
-## Cross-run memory
-
-With `persist=`, edge weights survive between runs. Each run improves retrieval for the next one:
+## Graph inspection
 
 ```python
-graph = ContextGraph(persist="./sentex.db")
+graph.stats()
+# → {"nodes": 3, "sentences": 47, "edges": 235, "edge_boosts": 12, "node_ids": [...]}
 
-# Run 1: baseline retrieval
-# Run 2: edges boosted from run 1 → better sentences surface
-# Run 3: even better
+graph.get_node("resources/research")
+# → ContextNode(id=..., produced_by=..., sentence_ids=..., l0=..., l2=..., ...)
 
-graph.history()   # list of past runs
+# Scan nodes by relevance (L0 level — fast, no sentence retrieval)
+graph.scan_nodes("immune cell coordination", top_k=3)
+# → [("resources/research", 0.87), ("working/analysis", 0.74), ...]
 ```
 
 ---
@@ -212,10 +218,69 @@ uvicorn sentex.server:app --port 8765
 ```
 
 ```
-POST /ingest     body: {node_id, content, agent_id}
+POST /put        body: {node_id, content, agent_id}
+POST /get        body: {node_id, query, budget, layer}
+POST /used       body: {node_ids: [...]}
+POST /scan       body: {query, top_k, scope}
 POST /assemble   body: {agent_id, reads, token_budget, query}
-GET  /nodes      list all nodes with L0 summaries
+GET  /nodes      list all nodes with token counts
+GET  /nodes/{id} inspect a single node
 GET  /health     node count, sentence count
+```
+
+OpenAPI docs at `http://localhost:8765/docs`.
+
+---
+
+## Pipeline decorator (optional orchestration)
+
+If you want Sentex to own the run loop rather than just managing context:
+
+```python
+from sentex import Pipeline, Read
+
+pipeline = Pipeline()
+
+@pipeline.agent(id="researcher", writes=["resources/research"])
+async def researcher(ctx):
+    return await ctx.llm("Research the immune system in detail.")
+
+@pipeline.agent(
+    id="writer",
+    reads=[Read("resources/research", layer="l1", budget=2000)],
+    writes=["working/script"],
+    token_budget=4000,
+)
+async def writer(ctx):
+    return await ctx.llm(ctx.render() + "\n\nWrite a 60-second video script.")
+
+result = await pipeline.run(
+    query="explain how the immune system works",
+    llm="gpt-4o",   # any LiteLLM model string
+)
+
+print(result.outputs["working/script"])
+print(result.summary())
+```
+
+---
+
+## Cross-run memory (SQLite-backed)
+
+Edge weights and node summaries persist between runs so retrieval improves over time:
+
+```python
+from sentex import Pipeline, MemoryStore
+
+store = MemoryStore("./sentex.db")
+pipeline = Pipeline(persist="./sentex.db")
+
+# Run 1: baseline retrieval
+# Run 2: L2 summaries cached, no regeneration needed
+# Run 3+: session history available
+
+store.all_sessions()
+# → [{"session_id": ..., "query": ..., "started_at": ..., "committed_at": ...}, ...]
 ```
 
 ---
@@ -224,9 +289,9 @@ GET  /health     node count, sentence count
 
 When content is ingested:
 1. Split into sentences (NLTK Punkt; code blocks and lists are atomic)
-2. Each sentence embedded (`all-MiniLM-L6-v2`, 384 dims, runs locally, no API key)
+2. Each sentence embedded (`all-MiniLM-L6-v2`, 384 dims, runs locally, no API key needed)
 3. K nearest neighbours computed across **all sentences in the graph** — not just within the current node. Sentences from different agents get edges automatically.
-4. L0 and L2 generated async via LiteLLM (any model, non-blocking)
+4. Extractive L0 (first sentence) and L2 (first ~300 tokens) built immediately; LLM-generated summaries are optional and async.
 
 When an agent retrieves at L1:
 ```
@@ -240,9 +305,8 @@ embed(query) → highest-sim sentence in this node (entry point)
 
 ## What Sentex does not do
 
-- No agent orchestration (bring your own — LangChain, CrewAI, AutoGen, anything)
-- No persistent memory across conversation sessions (pipeline context, not chat history)
-- No vector database required (numpy handles the scale)
+- No agent orchestration — bring your own (LangChain, CrewAI, AutoGen, anything)
+- No vector database required (numpy handles the KNN)
 - No graph database required (Python dict handles adjacency)
 - No cloud infrastructure (runs in-process; SQLite for optional persistence)
 - No opinion on which LLM you use (any LiteLLM-compatible model for L0/L2 generation)
@@ -251,15 +315,15 @@ embed(query) → highest-sim sentence in this node (entry point)
 
 ## Comparison
 
-| | LangChain | LlamaIndex | OpenViking | **Sentex** |
-|--|-----------|------------|------------|------------|
-| Sentence-level retrieval | No | No | No | **Yes** |
-| Cross-agent graph edges | No | No | No | **Yes** |
-| Works with any agent framework | Yes | Yes | No | **Yes** |
-| Budget enforcement pre-call | No | No | No | **Yes** |
-| Requires vector DB | No | Yes | Yes | **No** |
-| Cross-run memory | No | No | Yes | **Yes** |
-| Works fully in-memory | Yes | No | No | **Yes** |
+| | LangChain | LlamaIndex | **Sentex** |
+|--|-----------|------------|------------|
+| Sentence-level retrieval | No | No | **Yes** |
+| Cross-agent graph edges | No | No | **Yes** |
+| Works with any agent framework | Yes | Yes | **Yes** |
+| Budget enforcement pre-call | No | No | **Yes** |
+| Requires vector DB | No | Yes | **No** |
+| Runs fully in-memory | Yes | No | **Yes** |
+| HTTP server for polyglot pipelines | No | No | **Yes** |
 
 ---
 
