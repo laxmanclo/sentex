@@ -513,6 +513,17 @@ class ContextGraph:
     def node_count(self) -> int:
         return len(self._nodes)
 
+    def stats(self) -> dict:
+        """Return a summary of graph state — useful for debugging and monitoring."""
+        total_edges = sum(len(v) for v in self._adjacency.values())
+        return {
+            "nodes": self.node_count,
+            "sentences": self.sentence_count,
+            "edges": total_edges,
+            "edge_boosts": len(self._usage_boost),
+            "node_ids": list(self._nodes.keys()),
+        }
+
     # ------------------------------------------------------------------
     # Simple interface for bring-your-own-agent usage
     # ------------------------------------------------------------------

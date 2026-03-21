@@ -42,9 +42,6 @@ async def _lifespan(app: FastAPI):
         from .store import MemoryStore
         store = MemoryStore(persist)
         state.graph = ContextGraph()
-        boosts = store.load_edge_boosts()
-        for (src, dst), w in boosts.items():
-            state.graph._usage_boost[(src - 1, dst - 1)] = w
         state.graph._store = store
     else:
         state.graph = ContextGraph()
