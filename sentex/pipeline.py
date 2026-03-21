@@ -317,7 +317,13 @@ class Pipeline:
                     )
 
             # Track usage → boost edge weights in-graph and in store
-            used_ids = [r.node_id for r in manifest.reads if r.node_id in assembled.context]
+            used_ids = [
+                r.node_id for r in manifest.reads
+                if hasattr(r, "node_id") and r.node_id in assembled.context
+            ]
+            # Also mark auto: keys as used
+            auto_used = [k[5:] for k in assembled.context if k.startswith("auto:")]
+            used_ids.extend(auto_used)
             self.graph.mark_used(assembled, used_ids)
 
             if self._store and used_ids:

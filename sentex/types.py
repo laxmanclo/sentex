@@ -1,4 +1,4 @@
-"""Core data structures for Engram."""
+"""Core data structures for Sentex."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -39,6 +39,24 @@ class Read:
 
 
 @dataclass
+class AutoRead:
+    """Dynamic read — scan all nodes at L0, retrieve top-k at the declared layer.
+
+    Use when you don't know node IDs at pipeline-definition time.
+
+    Example:
+        AutoRead(top_k=3, layer="l1", budget_per_node=1000, scope="resources")
+        → scan all resources/* nodes at L0
+        → retrieve top-3 most relevant at L1
+        → returned in context as {"auto:resources/search": [...], ...}
+    """
+    top_k: int = 3
+    layer: str = "l1"
+    budget_per_node: int = 1000
+    scope: str | None = None    # e.g. "resources" to only scan resources/* nodes
+
+
+@dataclass
 class Write:
     node_id: str
 
@@ -46,7 +64,7 @@ class Write:
 @dataclass
 class AgentManifest:
     id: str
-    reads: list[Read]
+    reads: list[Read | AutoRead]
     writes: list[Write]
     token_budget: int
     fallback: str = "l2"        # layer to fall back to if l1 confidence low

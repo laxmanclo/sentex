@@ -10,6 +10,7 @@ from .session import SessionRecord
 from .types import (
     AgentManifest,
     AssembledContext,
+    AutoRead,
     ContextNode,
     Read,
     Write,
@@ -19,6 +20,7 @@ __all__ = [
     # Primary SDK — this is what you import
     "Pipeline",
     "Read",
+    "AutoRead",
     "Write",
     # Cross-run memory
     "MemoryStore",

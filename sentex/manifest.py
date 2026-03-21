@@ -13,12 +13,12 @@ Usage:
 """
 from __future__ import annotations
 
-from .types import AgentManifest, Read, Write
+from .types import AgentManifest, AutoRead, Read, Write
 
 
 def defineAgent(
     id: str,
-    reads: list[Read],
+    reads: list[Read | AutoRead],
     writes: list[str | Write],
     token_budget: int = 4000,
     fallback: str = "l2",
