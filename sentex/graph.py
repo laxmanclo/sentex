@@ -498,6 +498,68 @@ class ContextGraph:
     def node_count(self) -> int:
         return len(self._nodes)
 
+    # ------------------------------------------------------------------
+    # Simple interface for bring-your-own-agent usage
+    # ------------------------------------------------------------------
+
+    def put(self, node_id: str, content: str, agent_id: str = "agent") -> "ContextNode":
+        """Store an agent's output. Alias for ingest() with a simpler signature.
+
+        Call this after your agent produces output:
+            graph.put("search-results", my_agent.run(task))
+        """
+        return self.ingest(node_id, content, agent_id=agent_id, generate_summaries=False)
+
+    def get(
+        self,
+        node_id: str,
+        query: str,
+        budget: int = 2000,
+        layer: str = "l1",
+    ) -> str | list[str]:
+        """Retrieve context for a node. Returns sentences (L1) or text (L0/L2/L3).
+
+        Call this to build context for your next agent:
+            context = graph.get("search-results", query="write a script", budget=2000)
+            prompt = f"Use this:\\n{context}\\n\\nNow write the script."
+
+        Returns:
+            list[str] for layer="l1" (sentences, ordered by relevance)
+            str       for layer="l0" / "l2" / "l3"
+        """
+        content, _layer_used, _conf = self.retrieve(
+            node_id=node_id,
+            layer=layer,
+            query=query,
+            budget_tokens=budget,
+        )
+        return content
+
+    def render(self, node_id: str, query: str, budget: int = 2000) -> str:
+        """Get context as a single formatted string, ready to drop into a prompt.
+
+        Retrieves at L1 (sentence graph), formats as joined text.
+
+            prompt = f"Context:\\n{graph.render('search-results', query)}\\n\\nTask: ..."
+        """
+        content = self.get(node_id, query=query, budget=budget, layer="l1")
+        if isinstance(content, list):
+            return "\n".join(content)
+        return content
+
+    def used(self, node_id: str) -> None:
+        """Mark a node as used after your agent ran. Boosts future retrieval.
+
+        Call after the agent that consumed this node completes:
+            graph.used("search-results")
+        """
+        from .types import AssembledContext
+        dummy = AssembledContext(
+            context={node_id: []}, token_count=0, budget=0, utilization=0.0,
+            layers_used={}, compressed=[], missing=[], confidence={},
+        )
+        self.mark_used(dummy, used_ids=[node_id])
+
 
 # ------------------------------------------------------------------
 # Module-level helpers (used by retrieve and scan)
