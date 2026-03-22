@@ -56,6 +56,7 @@ class ContextGraph:
         hotness_freq_scale: float = 10.0,
         hotness_half_life_h: float = 24.0,
         confidence_mode: str = "adaptive",
+        adaptive_z: float = 0.5,
         cross_node_k: int = 1,
     ) -> None:
         self.embedder = embedder or Embedder()
@@ -70,6 +71,9 @@ class ContextGraph:
         # Confidence mode: "adaptive" (relative to corpus) or "absolute" (fixed threshold)
         # Adaptive is better for mixed-domain pipelines; absolute is simpler and predictable.
         self._confidence_mode = confidence_mode
+        # z controls selectivity in adaptive mode: higher = fewer L1 firings.
+        # 0.5 = "entry point must be half a std above the node median similarity".
+        self._adaptive_z = adaptive_z
 
         # After KNN, guarantee this many cross-node edges per node-pair.
         # Prevents cross-agent edges being crowded out by intra-node edges at small k.
@@ -304,7 +308,8 @@ class ContextGraph:
             fires = confidence >= confidence_threshold
         else:
             fires = _l1_fires_adaptive(
-                query_vec, self._embeddings, node.sentence_ids, confidence
+                query_vec, self._embeddings, node.sentence_ids, confidence,
+                z=self._adaptive_z,
             )
 
         # Record telemetry
@@ -527,11 +532,17 @@ class ContextGraph:
         # node A, and A is relevant, boost B's score proportionally.
         # ALPHA=0.3 means a highly-relevant source contributes 0.3 × its score
         # to derived nodes. This makes explicit provenance chains useful for retrieval.
+        # Visited set prevents A→B + B→A cycles from inflating scores on every call.
         _RELATION_ALPHA = 0.3
         _PROPAGATING_KINDS = {"derived_from", "summarizes", "extends"}
+        _seen_pairs: set[tuple[str, str]] = set()
         for rel in self._relations.all_relations():
             if rel.kind not in _PROPAGATING_KINDS:
                 continue
+            pair = (min(rel.src, rel.dst), max(rel.src, rel.dst))
+            if pair in _seen_pairs:
+                continue
+            _seen_pairs.add(pair)
             src_score = scores.get(rel.src, 0.0)
             dst_score = scores.get(rel.dst, 0.0)
             if dst_score > 0 and rel.dst in scores:
@@ -558,8 +569,10 @@ class ContextGraph:
 
         Returns list of (node_id, content, layer_used, confidence).
 
-        This is the dynamic equivalent of declaring a Read — useful when you
-        don't know the node IDs at pipeline-definition time.
+        confidence_threshold: passed through to retrieve(). In adaptive mode
+        (default), passing 0.0 forces L1 always; any other explicit non-default
+        value (e.g. 0.3, 0.8) switches to absolute comparison for that call.
+        The default (0.5) uses the graph's adaptive logic.
         """
         top_nodes = self.scan_nodes(query, top_k=top_k, scope=scope)
         results = []
@@ -900,11 +913,15 @@ def _ensure_cross_node_edges(
                 src_idx = src_node.sentence_ids[si]
                 dst_idx = dst_node.sentence_ids[di]
 
-                # Add edge in both directions if not already present
+                # Add edge in both directions if not already present,
+                # then re-sort by descending similarity and cap to knn_k so that
+                # BFS priority ordering stays correct and the list doesn't grow unbounded.
                 existing_src = {idx for idx, _ in adjacency.get(src_idx, [])}
                 if dst_idx not in existing_src:
                     adjacency.setdefault(src_idx, []).append((dst_idx, sim))
                     adjacency.setdefault(dst_idx, []).append((src_idx, sim))
+                    adjacency[src_idx].sort(key=lambda x: -x[1])
+                    adjacency[dst_idx].sort(key=lambda x: -x[1])
                     added += 1
 
                 tmp[si, di] = -1  # prevent re-selection

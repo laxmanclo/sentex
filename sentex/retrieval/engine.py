@@ -67,6 +67,7 @@ def retrieve_l1(
     # 2. BFS via max-heap (negate sim for min-heap)
     visited: set[int] = set()
     collected: list[tuple[str, float]] = []
+    collected_idxs: list[int] = []   # parallel to collected — stores global sentence idx
     token_total = 0
 
     # heap: (-similarity, sentence_idx)
@@ -89,14 +90,18 @@ def retrieve_l1(
             break
 
         collected.append((sentence, -neg_score))
+        collected_idxs.append(idx)
         token_total += toks
 
-        # Convergence check: compare current top-k to previous
-        current_idxs = sorted(
-            range(len(collected)),
-            key=lambda i: -collected[i][1]
-        )[:convergence_k]
-        current_top_k = frozenset(current_idxs)
+        # Convergence check: compare current top-k *global sentence indices* to previous.
+        # Must NOT use positional indices into collected — those change meaning as
+        # collected grows, making any two lists of the same length look "converged".
+        current_top_k = frozenset(
+            gidx for gidx, _ in sorted(
+                zip(collected_idxs, [s for _, s in collected]),
+                key=lambda x: -x[1]
+            )[:convergence_k]
+        )
 
         if len(collected) >= convergence_k:
             if current_top_k == top_k_set:
