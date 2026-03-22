@@ -295,12 +295,17 @@ class ContextGraph:
         # Adaptive threshold: check if confidence is meaningfully above the
         # median similarity for this node. In mixed-domain corpora all cosines
         # are low — a fixed 0.5 would always fall back to L2 truncation.
-        if self._confidence_mode == "adaptive":
+        _default_threshold = 0.5
+        if confidence_threshold == 0.0:
+            fires = True  # explicit zero → always use L1
+        elif confidence_threshold != _default_threshold or self._confidence_mode != "adaptive":
+            # Caller supplied a non-default threshold (e.g. 1.0 to force fallback),
+            # or graph is in absolute mode — use absolute comparison.
+            fires = confidence >= confidence_threshold
+        else:
             fires = _l1_fires_adaptive(
                 query_vec, self._embeddings, node.sentence_ids, confidence
             )
-        else:
-            fires = confidence >= confidence_threshold
 
         # Record telemetry
         if self._metrics is not None:

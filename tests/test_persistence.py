@@ -3,8 +3,8 @@ from pathlib import Path
 
 import numpy as np
 
-from sentex.graph import ContextGraph
-from sentex.embedder import Embedder
+from sentex.core.graph import ContextGraph
+from sentex.ingestion.embedder import Embedder
 from sentex import save, load
 
 

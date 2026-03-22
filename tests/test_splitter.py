@@ -1,4 +1,4 @@
-from sentex.splitter import split_sentences
+from sentex.ingestion.splitter import split_sentences
 
 
 def test_basic_prose():

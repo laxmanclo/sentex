@@ -9,9 +9,9 @@ import numpy as np
 import pytest
 
 from sentex import Pipeline, Read, MemoryStore
-from sentex.embedder import Embedder
-from sentex.graph import ContextGraph
-from sentex.pipeline import _extractive_summary, _scope
+from sentex.ingestion.embedder import Embedder
+from sentex.core.graph import ContextGraph
+from sentex.pipeline.pipeline import _extractive_summary, _scope
 
 
 class _FakeEmbedder(Embedder):
@@ -68,7 +68,7 @@ def test_extractive_summary_respects_budget():
     # Long text — summary should be shorter than input
     text = " ".join(["This is sentence number {}.".format(i) for i in range(200)])
     summary = _extractive_summary(text, max_tokens=50)
-    from sentex.tokens import count_tokens
+    from sentex.core.tokens import count_tokens
     assert count_tokens(summary) <= 55  # small tolerance
 
 

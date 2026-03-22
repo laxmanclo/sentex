@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 
 from sentex import Pipeline, Read, AutoRead
-from sentex.embedder import Embedder
-from sentex.graph import ContextGraph, _extractive_l0, _extractive_l2
-from sentex.types import ContextNode, L0L1L2L3TokenCounts
+from sentex.ingestion.embedder import Embedder
+from sentex.core.graph import ContextGraph, _extractive_l0, _extractive_l2
+from sentex.core.types import ContextNode, L0L1L2L3TokenCounts
 
 
 class _FakeEmbedder(Embedder):
@@ -166,7 +166,7 @@ def test_mark_used_boosts_cross_node_edges():
     g.ingest("node-a", "Alpha connects to beta through gamma.", "a1", generate_summaries=False)
     g.ingest("node-b", "Beta is related to alpha and delta.", "a2", generate_summaries=False)
 
-    from sentex.types import AssembledContext
+    from sentex.core.types import AssembledContext
     assembled = AssembledContext(
         context={"node-a": ["Alpha connects to beta."], "node-b": ["Beta is related."]},
         token_count=20, budget=4000, utilization=0.005,
@@ -204,7 +204,7 @@ def test_assemble_l1_budget_exceeded_falls_back_to_l2_not_l0():
     node.l2 = "Short summary of the big document."
     node.l0 = "Identity."
 
-    from sentex.manifest import defineAgent
+    from sentex.pipeline.manifest import defineAgent
     # Very tight total budget — L1 retrieval will exceed it
     agent = defineAgent(
         "tester",

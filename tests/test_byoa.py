@@ -7,8 +7,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sentex.graph import ContextGraph
-from sentex.embedder import Embedder
+from sentex.core.graph import ContextGraph
+from sentex.ingestion.embedder import Embedder
 
 
 class _DeterministicEmbedder(Embedder):

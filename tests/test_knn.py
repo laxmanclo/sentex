@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from sentex.knn import build_knn, update_knn
+from sentex.ingestion.knn import build_knn, update_knn
 
 
 def _random_vecs(n: int, d: int = 8, seed: int = 42) -> np.ndarray:

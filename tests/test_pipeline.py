@@ -6,8 +6,8 @@ import pytest
 import numpy as np
 
 from sentex import Pipeline, Read, Write
-from sentex.embedder import Embedder
-from sentex.graph import ContextGraph
+from sentex.ingestion.embedder import Embedder
+from sentex.core.graph import ContextGraph
 
 
 class _FakeEmbedder(Embedder):

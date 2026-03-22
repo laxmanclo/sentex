@@ -2,7 +2,7 @@
 import math
 import time
 
-from sentex.scoring import HotnessScore, compute_hotness
+from sentex.core.scoring import HotnessScore, compute_hotness
 
 
 def test_cold_edge_is_zero():
@@ -56,8 +56,8 @@ def test_to_from_dict_roundtrip():
 def test_graph_uses_hotness_boost(tmp_path):
     """Graph._usage_boost should be HotnessScore dicts after mark_used."""
     import numpy as np
-    from sentex.graph import ContextGraph
-    from sentex.embedder import Embedder
+    from sentex.core.graph import ContextGraph
+    from sentex.ingestion.embedder import Embedder
 
     class _FakeEmbedder(Embedder):
         def __init__(self):

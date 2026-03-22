@@ -7,10 +7,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sentex.graph import ContextGraph
-from sentex.embedder import Embedder
-from sentex.manifest import defineAgent
-from sentex.types import Read, Write
+from sentex.core.graph import ContextGraph
+from sentex.ingestion.embedder import Embedder
+from sentex.pipeline.manifest import defineAgent
+from sentex.core.types import Read, Write
 
 
 class _FakeEmbedder(Embedder):

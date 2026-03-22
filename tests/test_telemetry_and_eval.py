@@ -2,10 +2,10 @@
 import numpy as np
 import pytest
 
-from sentex.telemetry import MetricsCollector, OperationMetrics
-from sentex.eval import RetrievalEvaluator, EvalCase, EvalResult, _ndcg
-from sentex.embedder import Embedder
-from sentex.graph import ContextGraph
+from sentex.telemetry.collector import MetricsCollector, OperationMetrics
+from sentex.retrieval.eval import RetrievalEvaluator, EvalCase, EvalResult, _ndcg
+from sentex.ingestion.embedder import Embedder
+from sentex.core.graph import ContextGraph
 
 
 class _FakeEmbedder(Embedder):

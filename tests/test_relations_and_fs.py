@@ -2,9 +2,9 @@
 import numpy as np
 import pytest
 
-from sentex.relations import Relation, RelationIndex
-from sentex.embedder import Embedder
-from sentex.graph import ContextGraph
+from sentex.core.relations import Relation, RelationIndex
+from sentex.ingestion.embedder import Embedder
+from sentex.core.graph import ContextGraph
 
 
 # ------------------------------------------------------------------
@@ -172,7 +172,7 @@ def test_stats_includes_relations():
 # ------------------------------------------------------------------
 
 def test_fs_property_returns_graphfs():
-    from sentex.fs import GraphFS
+    from sentex.core.fs import GraphFS
     g = make_graph()
     assert isinstance(g.fs, GraphFS)
 
@@ -269,7 +269,7 @@ def test_fs_repr():
 
 def test_retrieve_convergence_flag():
     """retrieve_l1 should return a converged bool."""
-    from sentex.retrieval import retrieve_l1
+    from sentex.retrieval.engine import retrieve_l1
     import numpy as np
 
     dim = 16
