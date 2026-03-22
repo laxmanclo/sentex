@@ -65,7 +65,7 @@ def test_retrieve_l3():
     content = "Full raw content here."
     g.ingest("data", content, "agent-a", generate_summaries=False)
     result, layer, conf = g.retrieve("data", "l3", "anything", budget_tokens=9999)
-    assert result == content
+    assert result == [content]   # retrieve() always returns list[str]
     assert layer == "l3"
     assert conf == 1.0
 
@@ -91,7 +91,7 @@ def test_retrieve_l1_returns_sentences():
 def test_retrieve_missing_node():
     g = _graph()
     result, layer, conf = g.retrieve("nonexistent", "l1", "query", budget_tokens=500)
-    assert result == ""
+    assert result == [""]   # retrieve() always returns list[str]
     assert conf == 0.0
 
 

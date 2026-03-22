@@ -102,28 +102,31 @@ def test_get_l1_returns_list(graph):
     content = graph.get(
         "resources/search", query="immune cells", budget=5000, layer="l1"
     )
-    # L1 returns either list[str] (high confidence) or str (fallback)
-    assert isinstance(content, (list, str))
+    # get() always returns list[str] now — consistent regardless of layer/fallback
+    assert isinstance(content, list)
     assert content  # non-empty
 
 
-def test_get_l2_returns_string(graph):
+def test_get_l2_returns_list(graph):
     graph.put("resources/search", SEARCH_TEXT, agent_id="researcher")
     content = graph.get("resources/search", query="immune cells", budget=500, layer="l2")
-    assert isinstance(content, str)
-    assert content
+    assert isinstance(content, list)
+    assert len(content) == 1
+    assert content[0]
 
 
-def test_get_l0_returns_string(graph):
+def test_get_l0_returns_list(graph):
     graph.put("resources/search", SEARCH_TEXT, agent_id="researcher")
     content = graph.get("resources/search", query="immune cells", budget=500, layer="l0")
-    assert isinstance(content, str)
-    assert content
+    assert isinstance(content, list)
+    assert len(content) == 1
+    assert content[0]
 
 
-def test_get_missing_node_returns_empty(graph):
+def test_get_missing_node_returns_empty_list(graph):
     content = graph.get("nonexistent", query="anything", budget=1000)
-    assert content == ""
+    assert isinstance(content, list)
+    assert content[0] == ""
 
 
 def test_get_respects_budget(graph):

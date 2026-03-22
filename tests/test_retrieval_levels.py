@@ -48,7 +48,8 @@ def test_l3_returns_full_raw_content():
     g.ingest("doc", "Full content here. Second sentence.", "a1", generate_summaries=False)
     content, layer, conf = g.retrieve("doc", "l3", "query", budget_tokens=9999)
     assert layer == "l3"
-    assert "Full content here" in content
+    assert isinstance(content, list)
+    assert "Full content here" in content[0]
     assert conf == 1.0
 
 
@@ -59,7 +60,7 @@ def test_l3_no_truncation_at_any_budget():
     content, layer, _ = g.retrieve("doc", "l3", "query", budget_tokens=1)
     # L3 always returns full content regardless of budget declared in Read
     assert layer == "l3"
-    assert len(content) > 10
+    assert len(content[0]) > 10
 
 
 # ------------------------------------------------------------------
@@ -71,7 +72,8 @@ def test_l2_returns_stored_summary():
     node = g.ingest("doc", "Some content.", "a1", generate_summaries=False)
     node.l2 = "This is a manually set summary."
     content, layer, conf = g.retrieve("doc", "l2", "query", budget_tokens=9999)
-    assert "manually set summary" in content
+    assert isinstance(content, list)
+    assert "manually set summary" in content[0]
     assert layer == "l2"
     assert conf == 1.0
 
@@ -83,7 +85,7 @@ def test_l2_falls_back_to_l0_when_l2_empty_and_l0_set():
     node.l0 = "Identity line for this doc."
     content, layer, _ = g.retrieve("doc", "l2", "query", budget_tokens=9999)
     # Should serve l0 content but report actual layer
-    assert "Identity line" in content
+    assert "Identity line" in content[0]
     assert layer == "l0"   # BUG FIX: used to report "l2" even when serving l0
 
 
@@ -105,7 +107,8 @@ def test_l0_returns_stored_identity():
     node = g.ingest("doc", "Content.", "a1", generate_summaries=False)
     node.l0 = "A document about content."
     content, layer, _ = g.retrieve("doc", "l0", "query", budget_tokens=9999)
-    assert content == "A document about content."
+    assert isinstance(content, list)
+    assert content[0] == "A document about content."
     assert layer == "l0"
 
 
@@ -151,7 +154,7 @@ def test_l1_fallback_goes_to_l2_before_l0():
         "doc", "l1", "query", budget_tokens=9999,
         confidence_threshold=1.0, fallback="l2"
     )
-    assert "summary" in content.lower() or layer == "l2"
+    assert "summary" in content[0].lower() or layer == "l2"
 
 
 # ------------------------------------------------------------------

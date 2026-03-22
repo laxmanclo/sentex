@@ -55,6 +55,8 @@ class ContextGraph:
         metrics: "Any | None" = None,
         hotness_freq_scale: float = 10.0,
         hotness_half_life_h: float = 24.0,
+        confidence_mode: str = "adaptive",
+        cross_node_k: int = 1,
     ) -> None:
         self.embedder = embedder or Embedder()
         self.knn_k = knn_k
@@ -64,6 +66,14 @@ class ContextGraph:
         # Hotness scoring parameters
         self._hotness_freq_scale = hotness_freq_scale
         self._hotness_half_life_s = hotness_half_life_h * 3600
+
+        # Confidence mode: "adaptive" (relative to corpus) or "absolute" (fixed threshold)
+        # Adaptive is better for mixed-domain pipelines; absolute is simpler and predictable.
+        self._confidence_mode = confidence_mode
+
+        # After KNN, guarantee this many cross-node edges per node-pair.
+        # Prevents cross-agent edges being crowded out by intra-node edges at small k.
+        self._cross_node_k = cross_node_k
 
         # Global sentence store — shape (0,) until first ingest sets actual dim
         self._embeddings: np.ndarray = np.empty((0,), dtype=np.float32)
@@ -136,6 +146,12 @@ class ContextGraph:
                 self._adjacency = update_knn(
                     self._embeddings, self._adjacency, start_idx, k=self.knn_k
                 )
+            # Guarantee cross-node edges so BFS can always traverse agent boundaries.
+            # Without this, small k can crowd out cross-node edges with intra-node ones.
+            if self._cross_node_k > 0 and len(self._nodes) >= 2:
+                _ensure_cross_node_edges(
+                    self._embeddings, self._adjacency, self._nodes, k=self._cross_node_k
+                )
 
         sentence_ids = list(range(start_idx, start_idx + len(sentences)))
 
@@ -150,9 +166,11 @@ class ContextGraph:
             first_sentence=sentences[0] if sentences else "",
             token_counts=L0L1L2L3TokenCounts(l1=l1_tokens, l3=l3_tokens),
         )
-        # Always build extractive L2 from the first N sentences so the
-        # L1→L2 fallback chain never hits an empty string, even without LLM.
-        node.l2 = _build_extractive_l2(sentences)
+        # Build centroid-based extractive L2: pick the most *representative*
+        # sentences (closest to the document centroid) rather than the first N.
+        # This means mid-document content surfaces in L2 — critical for the
+        # L1-confidence-fails → L2-fallback path to remain useful.
+        node.l2 = _build_centroid_l2(sentences, vecs if sentences else None)
         node.token_counts.l2 = count_tokens(node.l2)
 
         self._nodes[node_id] = node
@@ -228,34 +246,40 @@ class ContextGraph:
         budget_tokens: int,
         confidence_threshold: float = 0.5,
         fallback: str = "l2",
-    ) -> tuple[str | list[str], str, float]:
+    ) -> tuple[list[str], str, float]:
         """Return (content, layer_used, confidence).
 
-        Handles layer fallback automatically. layer_used in the return value
-        always reflects what was actually served, not what was declared.
+        content is ALWAYS list[str] — single-element for L0/L2/L3, multi for L1.
+        This eliminates the str | list[str] ambiguity that caused silent bugs
+        when callers iterated over a fallback string character by character.
+
+        Confidence mode (set on ContextGraph init):
+          "adaptive" — threshold is relative to the query's similarity distribution
+                       across this node's sentences. Works well for mixed-domain
+                       pipelines where all cosines are low.
+          "absolute" — threshold is the raw confidence_threshold float (old behaviour).
         """
         node = self._nodes.get(node_id)
         if node is None:
-            return "", layer, 0.0
+            return [""], layer, 0.0
 
         if layer == "l3":
             txt = node.l3 if isinstance(node.l3, str) else str(node.l3)
-            return txt, "l3", 1.0
+            return [txt], "l3", 1.0
 
         if layer == "l2":
             content = node.l2 or _extractive_l2(node) or node.l0
-            actual = "l2" if node.l2 else ("l0" if not node.l2 and node.l0 else "l2")
-            return content, actual, 1.0
+            actual = "l2" if node.l2 else ("l0" if node.l0 else "l2")
+            return [content], actual, 1.0
 
         if layer == "l0":
             content = node.l0 or _extractive_l0(node)
-            return content, "l0", 1.0
+            return [content], "l0", 1.0
 
         # layer == "l1"
         if not node.sentence_ids or len(self._embeddings) == 0:
-            # No sentences ingested yet — serve L2 fallback
             content = node.l2 or _extractive_l2(node) or node.l0
-            return content, fallback, 0.0
+            return [content] if content else [""], fallback, 0.0
 
         query_vec = self.embedder.embed_one(query)
         adj = self._effective_adjacency()
@@ -268,25 +292,34 @@ class ContextGraph:
             candidate_ids=node.sentence_ids,
         )
 
-        # Record telemetry if collector is attached
+        # Adaptive threshold: check if confidence is meaningfully above the
+        # median similarity for this node. In mixed-domain corpora all cosines
+        # are low — a fixed 0.5 would always fall back to L2 truncation.
+        if self._confidence_mode == "adaptive":
+            fires = _l1_fires_adaptive(
+                query_vec, self._embeddings, node.sentence_ids, confidence
+            )
+        else:
+            fires = confidence >= confidence_threshold
+
+        # Record telemetry
         if self._metrics is not None:
             from .telemetry import OperationMetrics
-            from .tokens import count_tokens_list
             self._metrics.record(OperationMetrics(
                 operation="retrieve",
                 node_id=node_id,
-                duration_ms=0.0,   # caller times the full retrieve() call
+                duration_ms=0.0,
                 sentences_in=len(sentences),
                 tokens_out=count_tokens_list(sentences),
-                layer_used="l1",
+                layer_used="l1" if fires else fallback,
                 confidence=confidence,
                 converged=converged,
             ))
 
-        if confidence < confidence_threshold:
+        if not fires:
             content = node.l2 or _extractive_l2(node) or node.l0
             actual = "l2" if (node.l2 or _extractive_l2(node)) else "l0"
-            return content, actual, confidence
+            return [content] if content else [""], actual, confidence
 
         return sentences, "l1", confidence
 
@@ -471,21 +504,39 @@ class ContextGraph:
 
         query_vec = self.embedder.embed_one(query)
 
-        candidates: list[tuple[str, float]] = []
+        scores: dict[str, float] = {}
         for node_id, node in self._nodes.items():
             if scope and not node_id.startswith(scope):
                 continue
 
-            # Use L0 if available; fall back to extractive L0 from L2/sentences
-            l0_text = node.l0 or _extractive_l0(node)
+            # Use centroid-based L2 as L0 if no explicit L0 set — it's a better
+            # document representative than just the first sentence.
+            l0_text = node.l0 or node.l2 or _extractive_l0(node)
             if not l0_text:
                 continue
 
             l0_vec = self.embedder.embed_one(l0_text)
-            score = float(np.dot(query_vec, l0_vec))
-            candidates.append((node_id, score))
+            scores[node_id] = float(np.dot(query_vec, l0_vec))
 
-        candidates.sort(key=lambda x: -x[1])
+        # Relation-based score propagation: if node B is derived_from / summarizes
+        # node A, and A is relevant, boost B's score proportionally.
+        # ALPHA=0.3 means a highly-relevant source contributes 0.3 × its score
+        # to derived nodes. This makes explicit provenance chains useful for retrieval.
+        _RELATION_ALPHA = 0.3
+        _PROPAGATING_KINDS = {"derived_from", "summarizes", "extends"}
+        for rel in self._relations.all_relations():
+            if rel.kind not in _PROPAGATING_KINDS:
+                continue
+            src_score = scores.get(rel.src, 0.0)
+            dst_score = scores.get(rel.dst, 0.0)
+            if dst_score > 0 and rel.dst in scores:
+                # dst is the source of knowledge; boost src (the derivative)
+                scores[rel.src] = scores.get(rel.src, 0.0) + _RELATION_ALPHA * dst_score
+            if src_score > 0 and rel.src in scores:
+                # src derived from dst; also lightly boost dst (discovery direction)
+                scores[rel.dst] = scores.get(rel.dst, 0.0) + _RELATION_ALPHA * 0.5 * src_score
+
+        candidates = sorted(scores.items(), key=lambda x: -x[1])
         return candidates[:top_k]
 
     def retrieve_auto(
@@ -642,16 +693,18 @@ class ContextGraph:
         query: str,
         budget: int = 2000,
         layer: str = "l1",
-    ) -> str | list[str]:
-        """Retrieve context for a node. Returns sentences (L1) or text (L0/L2/L3).
+    ) -> list[str]:
+        """Retrieve context for a node. Always returns list[str].
+
+        For L1: multiple sentences ordered by relevance.
+        For L0/L2/L3: single-element list containing the text.
+
+        This consistent return type means `for sentence in graph.get(...)` is
+        always safe — no more silent character iteration when fallback fires.
 
         Call this to build context for your next agent:
-            context = graph.get("search-results", query="write a script", budget=2000)
-            prompt = f"Use this:\\n{context}\\n\\nNow write the script."
-
-        Returns:
-            list[str] for layer="l1" (sentences, ordered by relevance)
-            str       for layer="l0" / "l2" / "l3"
+            sentences = graph.get("search-results", query="write a script", budget=2000)
+            prompt = f"Use this:\\n{'\\n'.join(sentences)}\\n\\nNow write the script."
         """
         content, _layer_used, _conf = self.retrieve(
             node_id=node_id,
@@ -664,14 +717,9 @@ class ContextGraph:
     def render(self, node_id: str, query: str, budget: int = 2000) -> str:
         """Get context as a single formatted string, ready to drop into a prompt.
 
-        Retrieves at L1 (sentence graph), formats as joined text.
-
             prompt = f"Context:\\n{graph.render('search-results', query)}\\n\\nTask: ..."
         """
-        content = self.get(node_id, query=query, budget=budget, layer="l1")
-        if isinstance(content, list):
-            return "\n".join(content)
-        return content
+        return "\n".join(self.get(node_id, query=query, budget=budget, layer="l1"))
 
     def used(self, node_id: str) -> None:
         """Mark a node as used after your agent ran. Boosts future retrieval.
@@ -706,8 +754,64 @@ def _extractive_l2(node: "ContextNode") -> str:
     return node.l2 or ""
 
 
+def _build_centroid_l2(
+    sentences: list[str],
+    vecs: "np.ndarray | None",
+    max_tokens: int = 300,
+) -> str:
+    """Build an extractive L2 by selecting sentences closest to the document centroid.
+
+    Unlike first-N truncation, this surfaces content from anywhere in the document —
+    critical for the L1-confidence-low → L2-fallback path. A query about content in
+    the middle of a long document now gets a representative summary, not just the header.
+
+    Falls back to first-N if embeddings are unavailable.
+    """
+    from .tokens import count_tokens as _ct
+    if not sentences:
+        return ""
+    if vecs is None or len(vecs) == 0:
+        # Fallback: first-N (old behaviour, only when embeddings unavailable)
+        collected, total = [], 0
+        for s in sentences:
+            t = _ct(s)
+            if total + t > max_tokens:
+                break
+            collected.append(s)
+            total += t
+        return " ".join(collected)
+
+    # Centroid = mean of all sentence embeddings, normalised
+    centroid = vecs.mean(axis=0)
+    norm = np.linalg.norm(centroid)
+    if norm > 0:
+        centroid /= norm
+
+    # Score each sentence by similarity to centroid
+    sims = vecs @ centroid  # (n,)
+    order = np.argsort(-sims)  # highest-sim first
+
+    # Greedy selection within token budget — prefer high-sim sentences but
+    # allow gaps so a long sentence doesn't block shorter but relevant ones.
+    selected: list[tuple[int, str]] = []
+    total = 0
+    for idx in order:
+        s = sentences[idx]
+        t = _ct(s)
+        if total + t > max_tokens:
+            continue  # try next sentence (don't break — shorter ones may fit)
+        selected.append((int(idx), s))
+        total += t
+        if total >= max_tokens:
+            break
+
+    # Re-sort by original position to maintain narrative flow
+    selected.sort(key=lambda x: x[0])
+    return " ".join(s for _, s in selected)
+
+
 def _build_extractive_l2(sentences: list[str], max_tokens: int = 300) -> str:
-    """Build an extractive L2 from the first N sentences up to max_tokens."""
+    """First-N truncation fallback (kept for backward compat, prefer _build_centroid_l2)."""
     from .tokens import count_tokens as _ct
     collected, total = [], 0
     for s in sentences:
@@ -717,6 +821,90 @@ def _build_extractive_l2(sentences: list[str], max_tokens: int = 300) -> str:
         collected.append(s)
         total += t
     return " ".join(collected)
+
+
+def _l1_fires_adaptive(
+    query_vec: "np.ndarray",
+    embeddings: "np.ndarray",
+    sentence_ids: list[int],
+    confidence: float,
+    z: float = 0.5,
+) -> bool:
+    """Return True if L1 retrieval is worth serving for this query.
+
+    Instead of comparing confidence against a fixed 0.5, we compare it against
+    the distribution of similarities for this node's sentences.
+
+    Fires if: confidence >= median(node_sims) + z * std(node_sims)
+
+    Why this works for mixed-domain corpora:
+    - In a mixed pipeline (company + tech + market), all cosines are low (0.2-0.4)
+    - Fixed threshold 0.5 → always falls back to L2 truncation
+    - Adaptive: if median is 0.22 and std is 0.08, threshold = 0.26 → fires correctly
+
+    z=0.5 means "entry point must be half a std above the node median".
+    Higher z = more selective (fewer L1 firings), lower z = more permissive.
+    """
+    if len(sentence_ids) == 0:
+        return False
+    idx_arr = np.array(sentence_ids, dtype=np.int32)
+    node_sims = embeddings[idx_arr] @ query_vec
+    threshold = float(np.median(node_sims)) + z * float(np.std(node_sims))
+    return confidence >= max(threshold, 0.05)  # floor to prevent degenerate cases
+
+
+def _ensure_cross_node_edges(
+    embeddings: "np.ndarray",
+    adjacency: "Adjacency",
+    nodes: "dict",
+    k: int = 1,
+) -> None:
+    """Guarantee at least k cross-node KNN edges per node-pair.
+
+    With small k (e.g. k=5) on coherent documents, all KNN neighbours of a
+    sentence are from the same document — cross-agent edges get crowded out.
+    This function finds the best cross-node sentence pairs and inserts edges
+    that wouldn't otherwise exist, ensuring BFS can always traverse boundaries.
+
+    Modifies adjacency in-place. O(N_nodes² × sentences_per_node).
+    """
+    node_ids = list(nodes.keys())
+    if len(node_ids) < 2:
+        return
+
+    for i in range(len(node_ids)):
+        for j in range(i + 1, len(node_ids)):
+            src_node = nodes[node_ids[i]]
+            dst_node = nodes[node_ids[j]]
+            if not src_node.sentence_ids or not dst_node.sentence_ids:
+                continue
+
+            src_emb = embeddings[src_node.sentence_ids]  # (n, d)
+            dst_emb = embeddings[dst_node.sentence_ids]  # (m, d)
+            cross_sims = src_emb @ dst_emb.T             # (n, m)
+
+            added = 0
+            # Greedily pick best pairs until we've added k cross edges
+            tmp = cross_sims.copy()
+            while added < k:
+                flat_idx = int(np.argmax(tmp))
+                si, di = divmod(flat_idx, tmp.shape[1])
+                sim = float(tmp[si, di])
+                if sim <= 0:
+                    break
+                src_idx = src_node.sentence_ids[si]
+                dst_idx = dst_node.sentence_ids[di]
+
+                # Add edge in both directions if not already present
+                existing_src = {idx for idx, _ in adjacency.get(src_idx, [])}
+                if dst_idx not in existing_src:
+                    adjacency.setdefault(src_idx, []).append((dst_idx, sim))
+                    adjacency.setdefault(dst_idx, []).append((src_idx, sim))
+                    added += 1
+
+                tmp[si, di] = -1  # prevent re-selection
+                if tmp.max() <= 0:
+                    break
 
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
