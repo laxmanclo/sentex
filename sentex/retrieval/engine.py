@@ -25,14 +25,19 @@ def retrieve_l1(
     adjacency: Adjacency,
     budget_tokens: int,
     candidate_ids: list[int] | None = None,
+    scope_ids: set[int] | None = None,
     convergence_k: int = 5,
     convergence_patience: int = 3,
 ) -> tuple[list[str], float, bool]:
     """Return (sentences, confidence_score, converged).
 
     Args:
-        candidate_ids:         Restrict entry-point search to these indices
-                               (used for per-node retrieval).
+        candidate_ids:  Restrict entry-point search to these indices.
+        scope_ids:      If set, BFS traversal is restricted to these sentence
+                        indices. Prevents cross-node contamination when retrieving
+                        from a specific node — without this, BFS follows cross-node
+                        KNN edges and mixes sentences from other agents.
+                        Defaults to None (unrestricted) for global retrieval.
         convergence_k:         Track top-k sentences for convergence check.
         convergence_patience:  Stop if top-k set is unchanged for this many
                                consecutive heap pops.
@@ -113,9 +118,11 @@ def retrieve_l1(
                 stable_streak = 0
             top_k_set = current_top_k
 
-        # Expand neighbours
+        # Expand neighbours — respect scope_ids to prevent cross-node contamination
         for neighbor_idx, _edge_sim in adjacency.get(idx, []):
             if neighbor_idx not in visited:
+                if scope_ids is not None and neighbor_idx not in scope_ids:
+                    continue  # skip sentences outside this node's scope
                 score = float(sim_lookup[neighbor_idx])
                 heapq.heappush(heap, (-score, neighbor_idx))
 

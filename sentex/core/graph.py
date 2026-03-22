@@ -294,6 +294,7 @@ class ContextGraph:
             adj,
             budget_tokens,
             candidate_ids=node.sentence_ids,
+            scope_ids=set(node.sentence_ids),  # scope BFS to this node — prevents cross-node contamination
         )
 
         # Adaptive threshold: check if confidence is meaningfully above the
@@ -327,6 +328,16 @@ class ContextGraph:
             ))
 
         if not fires:
+            # L1 confidence too low — fall back to a query-aware extractive summary.
+            # This is query-specific (picks sentences closest to the query vector),
+            # unlike the stored node.l2 which is centroid-based and query-agnostic.
+            if node.sentence_ids:
+                content = _query_aware_l2(
+                    query_vec, self._embeddings, self._sentences,
+                    node.sentence_ids, budget_tokens,
+                )
+                if content:
+                    return [content], "l2", confidence
             content = node.l2 or _extractive_l2(node) or node.l0
             actual = "l2" if (node.l2 or _extractive_l2(node)) else "l0"
             return [content] if content else [""], actual, confidence
@@ -380,10 +391,13 @@ class ContextGraph:
                 missing.append(node_id)
                 continue
 
+            # Use per-Read query override if provided, else fall back to pipeline query
+            effective_query = read.query if read.query else query
+
             content, layer_used, conf = self.retrieve(
                 node_id=node_id,
                 layer=read.layer,
-                query=query,
+                query=effective_query,
                 budget_tokens=read.budget,
                 confidence_threshold=agent.confidence_threshold,
                 fallback=agent.fallback,
@@ -407,7 +421,7 @@ class ContextGraph:
                     fb_content, fb_layer_used, fb_conf = self.retrieve(
                         node_id=node_id,
                         layer=fb_layer,
-                        query=query,
+                        query=effective_query,
                         budget_tokens=remaining,
                         confidence_threshold=agent.confidence_threshold,
                         fallback=agent.fallback,
@@ -839,6 +853,45 @@ def _build_extractive_l2(sentences: list[str], max_tokens: int = 300) -> str:
         collected.append(s)
         total += t
     return " ".join(collected)
+
+
+def _query_aware_l2(
+    query_vec: "np.ndarray",
+    embeddings: "np.ndarray",
+    sentences: list[str],
+    sentence_ids: list[int],
+    budget_tokens: int,
+) -> str:
+    """Build a query-aware extractive summary at request time.
+
+    Unlike the ingest-time centroid L2, this ranks sentences by cosine similarity
+    to the actual query vector — so the summary reflects what the agent actually
+    needs, not just what's "central" to the document.
+
+    Sentences are selected greedily by relevance until the budget is exhausted,
+    then re-ordered by original position for narrative coherence.
+    """
+    from .tokens import count_tokens as _ct
+    if not sentence_ids:
+        return ""
+    idx_arr = np.array(sentence_ids, dtype=np.int32)
+    sims = embeddings[idx_arr] @ query_vec          # (n,)
+    ranked = sorted(zip(sentence_ids, sims.tolist()), key=lambda x: -x[1])
+
+    selected: list[tuple[int, str]] = []
+    total = 0
+    for gidx, _ in ranked:
+        s = sentences[gidx]
+        t = _ct(s)
+        if total + t > budget_tokens:
+            continue
+        selected.append((gidx, s))
+        total += t
+        if total >= budget_tokens:
+            break
+
+    selected.sort(key=lambda x: x[0])   # restore narrative order
+    return " ".join(s for _, s in selected)
 
 
 def _l1_fires_adaptive(

@@ -37,6 +37,7 @@ class Read:
     node_id: str
     layer: str = "l1"           # "l0" | "l1" | "l2" | "l3"
     budget: int = 2000          # token budget for l1 retrieval
+    query: str | None = None    # per-read query override (overrides assemble_for query for this node)
 
 
 @dataclass
